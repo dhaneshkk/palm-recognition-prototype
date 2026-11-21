@@ -88,6 +88,10 @@ pub fn write_f32(path: &Path, rows: usize, cols: usize, data: &[f32]) -> Result<
     write(path, "<f4", &shape, &data.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<_>>())
 }
 
+pub fn write_u8(path: &Path, rows: usize, cols: usize, data: &[u8]) -> Result<()> {
+    write(path, "|u1", &format!("({rows}, {cols})"), data)
+}
+
 pub fn write_strings(path: &Path, items: &[String]) -> Result<()> {
     let width = items.iter().map(|s| s.chars().count()).max().unwrap_or(1).max(1);
     let mut payload = Vec::with_capacity(items.len() * width * 4);

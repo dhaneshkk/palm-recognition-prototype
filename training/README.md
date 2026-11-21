@@ -17,10 +17,11 @@ Rust port reproduces bit-exactly (`rust/tests/parity.rs`).
 
 ```bash
 pip install -r training/requirements.txt
-python training/prepare.py dataset/archive/session1 dataset/archive/session2 -o data/rois.npz
-python training/train.py data/rois.npz --out rust/models --epochs 40      # GPU recommended
+(cd rust && cargo build --release)                                         # valley crops are cut by Rust
+python training/prepare.py dataset/archive/session1 dataset/archive/session2 -o data/rois.npz --roi valley
+python training/train.py data/rois.npz --out rust/models --epochs 40 --loss subcenter   # GPU recommended
 
-cd rust && cargo build --release
+cd rust
 B=target/release/palmprint
 $B verify-model                                          # Rust loads exactly what Python exported
 $B --embeddings ../data/emb.npy --names ../data/names.npy build-db ../dataset/archive/session1 ../dataset/archive/session2
@@ -36,7 +37,7 @@ notebook `training/train_colab.ipynb`.
 1. **Open-set split by palm** (seeded): 70 % of palms train, 15 % calibrate, 15 % test. Test palms are
    never seen in training, which is how the matcher is used (new people enroll).
 2. **Loss:** supervised contrastive (SupCon) over P palms × K images per batch, two augmented views
-   each, with the prototype's augmentations. The dataset's names give identity (10 consecutive images
+   each, with the prototype's augmentations; or (sub-center) ArcFace — see below. The dataset's names give identity (10 consecutive images
    per palm per session), so labels are free. `--loss simclr` keeps the prototype's self-supervised
    NT-Xent.
 3. **Optimiser:** AdamW wrapped in **SAM** (sharpness-aware minimisation, ρ = 0.05; BatchNorm statistics
@@ -52,6 +53,49 @@ notebook `training/train_colab.ipynb`.
 
 The exported embedding is the 512-d backbone output, as before; the projection head is used only for
 the loss. Inputs are gray/255 replicated to 3 channels with no mean/std, as in the prototype.
+
+## Palm region, losses and backbones
+
+* **`prepare.py --roi valley`** (recommended) trains on crops aligned to the finger valleys: the
+  Rust binary (`palmprint rois`, `rust/src/align.rs`) finds the index–middle and ring–little gaps,
+  rotates and scales the crop to them, and Python packs the result. Training and inference therefore
+  use one implementation. `--roi centroid` keeps the original crop (Python, bit-exact with Rust).
+  The model card's `"roi"` tells every Rust command which crop to cut.
+* **`--loss subcenter`** (sub-center ArcFace, K = `--subcenters` 3) and **`--loss arcface`** (K = 1):
+  additive angular margin `--margin` 0.5 at scale `--scale` 30, the margin ramped from 0 over
+  `--margin-warmup` 3 epochs (`rust/lean/Match.lean`: `warm_le`, `warm_mono`, `warm_start`,
+  `warm_full`), plus `--aux-supcon` 0.1 × SupCon on the projection head. Only the 512-d backbone is
+  exported; the class weights are discarded.
+* **`--backbone mobilefacenet`**: depthwise bottlenecks, global depthwise conv (GDConv) head, ~1.2 M
+  parameters, 512-d output for the 138×138 crop (`training/models.py`). No ImageNet weights exist for
+  it, so it starts from scratch. Needs more memory per image than ResNet-18 on CPU (`--p 8` on a 7 GB
+  machine).
+* The input contract is unchanged ([0, 1], gray replicated to 3 channels), so the Rust encoder needs
+  no change for any of these.
+
+**Synthetic comparison** (60 drawn palms × 2 sessions × 10; 8 epochs from scratch on 2 CPU threads;
+9 unseen test palms, 1,710 genuine and 14,400 impostor pairs; a pipeline check, not an accuracy claim):
+
+| run | crop | loss | backbone | palms/batch | test EER | MCC at threshold | rank-1 |
+|---|---|---|---|---|---|---|---|
+| A | centroid | SupCon | ResNet-18 | 16 | 35.3 % | 0.278 | 86.7 % |
+| B | valley | SupCon | ResNet-18 | 16 | 26.0 % | 0.372 | 98.9 % |
+| C | valley | sub-center ArcFace | ResNet-18 | 16 | 24.9 % | 0.433 | 100 % |
+| C2 | valley | sub-center ArcFace | ResNet-18 | 8 | 12.3 % | 0.474 | 98.9 % |
+| D | valley | sub-center ArcFace | MobileFaceNet | 8 | 21.1 % | 0.292 | 95.6 % |
+| E | valley | ArcFace | MobileFaceNet | 8 | 21.9 % | 0.282 | 96.7 % |
+
+* Aligning the crop helped most here (A → B: EER 35 → 26 %, rank-1 87 → 99 %), and sub-center ArcFace
+  helped on top (B → C). The drawn hands are rotated up to ±8°, which is exactly what alignment removes,
+  so real gains will differ.
+* MobileFaceNet didn't train in these 40 steps from scratch (loss flat, calibration EER rising, cosines
+  bunched near 1). That says nothing about it on the real dataset with a GPU and 40+ epochs; compare it
+  there before choosing.
+* Palm-ridge codes gain the most from alignment, since they compare line orientations cell by cell:
+  a 3-epoch valley run through the web app gave ridge-only test EER 2.0 % (19.99 % on centroid crops
+  earlier), and the fused score reached MCC 0.977 at its threshold (CNN alone 0.393).
+* Rust recomputed run C from its own crops and embeddings and matched Python on the test palms (EER
+  24.91 vs 24.90 %, MCC 0.434 vs 0.433; one pair on the threshold differs by float rounding).
 
 ## Palm-ridge fusion
 

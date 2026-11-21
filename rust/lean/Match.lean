@@ -111,3 +111,41 @@ theorem fuse_mono (W w R c₁ c₂ d₁ d₂ : Nat) (hc : c₁ ≤ c₂) (hd : d
 theorem fuse_ends (W R c d : Nat) : fuse W W R c d = W * c ∧ fuse W 0 R c d = W * (R - d) := by
   unfold fuse
   simp
+
+/-! ## ArcFace margin warm-up (training/train.py, models.SubCenterArcFace.set_margin)
+
+m_e = m · min(1, e / W) for epoch e and warm-up length W (fixed point: ⌊m·e/W⌋ before W). The margin
+never exceeds m, never decreases from one epoch to the next, starts at 0 and is m from epoch W on. -/
+
+def warm (m W e : Nat) : Nat := if W ≤ e then m else m * e / W
+
+theorem warm_le (m W e : Nat) : warm m W e ≤ m := by
+  unfold warm
+  split
+  · exact Nat.le_refl m
+  · rename_i h
+    exact Nat.le_trans (Nat.div_le_div_right (Nat.mul_le_mul_left m (Nat.le_of_lt (Nat.lt_of_not_le h)))) (by
+      rcases Nat.eq_zero_or_pos W with hW | hW
+      · simp [hW]
+      · exact Nat.le_of_eq (Nat.mul_div_cancel m hW))
+
+theorem warm_mono (m W e : Nat) : warm m W e ≤ warm m W (e + 1) := by
+  unfold warm
+  by_cases h1 : W ≤ e
+  · have : W ≤ e + 1 := by omega
+    simp [h1, this]
+  · by_cases h2 : W ≤ e + 1
+    · simp only [h1, h2, if_false, if_true]
+      have := warm_le m W e
+      unfold warm at this
+      simpa [h1] using this
+    · simp only [h1, h2, if_false]
+      exact Nat.div_le_div_right (Nat.mul_le_mul_left m (by omega))
+
+theorem warm_start (m W : Nat) (hW : 0 < W) : warm m W 0 = 0 := by
+  unfold warm
+  rw [if_neg (by omega)]
+  simp
+
+theorem warm_full (m W e : Nat) (h : W ≤ e) : warm m W e = m := by
+  simp [warm, h]

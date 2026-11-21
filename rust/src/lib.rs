@@ -3,6 +3,7 @@
 //! database, a database builder, evaluation, a web UI and an OpenAI-compatible API.
 
 pub mod card;
+pub mod align;
 pub mod contours;
 pub mod encoder;
 pub mod faces;

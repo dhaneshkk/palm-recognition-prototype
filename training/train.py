@@ -2,8 +2,8 @@
 
     python training/train.py data/rois.npz --out rust/models --epochs 40
 
-Pipeline: identity-disjoint split (train / cal / test palms) → ResNet-18 + projection head trained with
-supervised-contrastive loss (or the prototype's self-supervised NT-Xent, --loss simclr) under SAM →
+Pipeline: identity-disjoint split (train / cal / test palms) → ResNet-18 or MobileFaceNet trained with
+supervised-contrastive loss, (sub-center) ArcFace, or the prototype's NT-Xent, always under SAM →
 model selected by calibration-set EER → verification threshold calibrated on the calibration palms at a
 target FAR → test-palm metrics (EER, TAR@FAR, MCC at the threshold, cross-session rank-1) →
 ONNX export of the 512-d backbone + model card + parity fixtures that `palmprint verify-model` checks.
@@ -18,27 +18,21 @@ import torchvision
 from torchvision import transforms
 
 from common import EMBED_DIM, SIDE, log, split_ids
+import models
 from metrics import evaluate, far_threshold
 
 
 # ── model ───────────────────────────────────────────────────────────────────────────────────────────
 class Encoder(nn.Module):
-    """ResNet-18 backbone (what inference uses: 512-d pooled features) + MLP projection head (training only)."""
+    """Backbone (what inference uses: 512-d features) + MLP projection head (contrastive losses only)."""
 
-    def __init__(self, proj_dim=128, pretrained=True):
+    def __init__(self, name="resnet18", proj_dim=128, pretrained=True):
         super().__init__()
-        r = None
-        if pretrained:
-            try:
-                r = torchvision.models.resnet18(weights=torchvision.models.ResNet18_Weights.IMAGENET1K_V1)
-            except Exception as e:  # offline: train from scratch
-                log("warning", msg=f"ImageNet weights unavailable ({type(e).__name__}); training from scratch")
-        r = r or torchvision.models.resnet18(weights=None)
-        self.backbone = nn.Sequential(*list(r.children())[:-1])
+        self.backbone = models.backbone(name, pretrained)
         self.head = nn.Sequential(nn.Linear(512, 512), nn.ReLU(inplace=True), nn.Linear(512, proj_dim))
 
     def features(self, x):
-        return self.backbone(x).flatten(1)
+        return self.backbone(x)
 
     def forward(self, x):
         return self.head(self.features(x))
@@ -52,7 +46,7 @@ class Backbone(nn.Module):
         self.backbone = enc.backbone
 
     def forward(self, x):
-        return self.backbone(x).flatten(1)
+        return self.backbone(x)
 
 
 # ── losses ──────────────────────────────────────────────────────────────────────────────────────────
@@ -155,7 +149,14 @@ def main():
     ap.add_argument("--out", default="rust/models")
     ap.add_argument("--name", default="palmprint_encoder_512")
     ap.add_argument("--epochs", type=int, default=40)
-    ap.add_argument("--loss", choices=["supcon", "simclr"], default="supcon")
+    ap.add_argument("--loss", choices=["supcon", "simclr", "arcface", "subcenter"], default="supcon",
+                    help="supcon / simclr: contrastive; arcface: additive angular margin; subcenter: sub-center ArcFace")
+    ap.add_argument("--backbone", choices=["resnet18", "mobilefacenet"], default="resnet18")
+    ap.add_argument("--margin", type=float, default=0.5, help="ArcFace margin m (radians)")
+    ap.add_argument("--scale", type=float, default=30.0, help="ArcFace scale s")
+    ap.add_argument("--subcenters", type=int, default=3, help="K for --loss subcenter")
+    ap.add_argument("--margin-warmup", type=int, default=3, help="epochs to ramp the margin from 0 to m")
+    ap.add_argument("--aux-supcon", type=float, default=0.1, help="weight of an extra SupCon term with the margin losses")
     ap.add_argument("--p", type=int, default=16, help="palms per batch")
     ap.add_argument("--k", type=int, default=4, help="images per palm per batch")
     ap.add_argument("--lr", type=float, default=3e-4)
@@ -173,15 +174,20 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     d = np.load(a.data)
     rois, names, ids, sessions = d["rois"], d["names"], d["ids"], d["sessions"]
+    roi_mode = str(d["roi"]) if "roi" in d.files else "centroid"
     split = split_ids(ids, a.seed)
     idx = {s: np.flatnonzero(np.isin(ids, split[s])) for s in split}
     log("data", images=len(rois), palms=len(set(ids.tolist())), **{f"{s}_palms": len(split[s]) for s in split},
         **{f"{s}_images": len(idx[s]) for s in split}, device=str(device))
 
-    model = Encoder(pretrained=not a.no_pretrained).to(device)
-    base = torch.optim.AdamW(model.parameters(), lr=a.lr, weight_decay=1e-4)
-    sam = SAM(model.parameters(), base, rho=a.rho)
+    model = Encoder(a.backbone, pretrained=not a.no_pretrained).to(device)
     tr_ids = ids[idx["train"]]
+    margin = a.loss in ("arcface", "subcenter")
+    cls = {int(v): k for k, v in enumerate(sorted(set(tr_ids.tolist())))}  # train palm id → class index
+    head = models.SubCenterArcFace(512, len(cls), k=a.subcenters if a.loss == "subcenter" else 1, s=a.scale, m=a.margin).to(device) if margin else None
+    params = list(model.parameters()) + (list(head.parameters()) if head is not None else [])
+    base = torch.optim.AdamW(params, lr=a.lr, weight_decay=1e-4)
+    sam = SAM(params, base, rho=a.rho)
     steps_per_epoch = max(1, len(set(tr_ids.tolist())) // a.p)
     if a.max_steps:
         steps_per_epoch = min(steps_per_epoch, a.max_steps)
@@ -191,14 +197,24 @@ def main():
     def loss_on(xb, yb):
         v1 = torch.stack([AUG(x) for x in xb])
         v2 = torch.stack([AUG(x) for x in xb])
+        yy = torch.cat([yb, yb]).to(device)
+        if margin:
+            f = model.features(torch.cat([v1, v2]).to(device))
+            loss = head(f, torch.tensor([cls[int(v)] for v in yy.tolist()], device=device))
+            if a.aux_supcon > 0:
+                loss = loss + a.aux_supcon * supcon_loss(model.head(f), yy, a.temperature)
+            return loss
         z = model(torch.cat([v1, v2]).to(device))
         if a.loss == "supcon":
-            return supcon_loss(z, torch.cat([yb, yb]).to(device), a.temperature)
+            return supcon_loss(z, yy, a.temperature)
         return nt_xent_loss(z, a.temperature)
 
     best, best_state, history = None, None, []
     for ep in range(a.epochs):
         model.train()
+        if head is not None:
+            head.train()
+            head.set_margin(a.margin * min(1.0, ep / max(a.margin_warmup, 1)))  # lean/Match.lean: warmup_*
         tot, n = 0.0, 0
         for step, b in enumerate(pk_batches(tr_ids, a.p, a.k, rng)):
             if step >= steps_per_epoch:
@@ -249,14 +265,18 @@ def main():
         "onnx_sha256": hashlib.sha256(open(onnx_path, "rb").read()).hexdigest(),
         "input": {"name": "input", "shape": [None, 3, SIDE, SIDE], "values": "preprocessed gray ROI / 255, replicated to 3 channels, no mean/std"},
         "output": {"name": "embedding", "dim": EMBED_DIM, "compare": "cosine"},
-        "preprocessing": "preprocess/preprocessor.py (Rust: rust/src/preprocess.rs, bit-exact)",
+        "preprocessing": ("preprocess/preprocessor.py (Rust: rust/src/preprocess.rs, bit-exact)" if roi_mode == "centroid"
+                          else "finger-valley aligned ROI, cut by rust/src/align.rs for both training and inference"),
+        "roi": roi_mode,
         "threshold": thr,
         "threshold_rule": f"smallest float32 above the ⌊{a.target_far}·N⌋-th largest calibration impostor score (lean/Match.lean: far_threshold_bound)",
         "target_far": a.target_far,
         "identity_block": a.block,
         "split": split,
         "metrics": {"calibration": cal, "test": test},
-        "training": {"loss": a.loss, "optimizer": "AdamW + SAM", "rho": a.rho, "lr": a.lr, "epochs": a.epochs,
+        "training": {"loss": a.loss, "backbone": a.backbone, "margin": a.margin if margin else None, "scale": a.scale if margin else None,
+                     "subcenters": a.subcenters if a.loss == "subcenter" else None, "margin_warmup": a.margin_warmup if margin else None,
+                     "aux_supcon": a.aux_supcon if margin else None, "optimizer": "AdamW + SAM", "rho": a.rho, "lr": a.lr, "epochs": a.epochs,
                      "p": a.p, "k": a.k, "temperature": a.temperature, "pretrained": not a.no_pretrained,
                      "seed": a.seed, "best_cal_eer": best, "history": history},
         "onnx_vs_pytorch_max_abs": float(np.abs(got - ref).max()),

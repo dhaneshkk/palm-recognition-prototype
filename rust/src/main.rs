@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use palmprint::card::ModelCard;
 use palmprint::encoder::Encoder;
-use palmprint::preprocess::{load, preprocess, TARGET};
+use palmprint::preprocess::{load, TARGET};
 use palmprint::{ops, server};
 use std::path::PathBuf;
 
@@ -67,6 +67,15 @@ enum Cmd {
         #[arg(long, default_value_t = 1)]
         ridge_shift: isize,
     },
+    /// Palm regions for Python training, cut the way inference will cut them:
+    /// <out>.u8.npy (rows of 138×138 uint8) and <out>.names.npy
+    Rois {
+        #[arg(long, default_value = "valley")]
+        mode: String,
+        #[arg(long)]
+        out: PathBuf,
+        dirs: Vec<PathBuf>,
+    },
     /// Check the ONNX file against the Python trainer's export: SHA-256 in the card, and embeddings of
     /// the parity inputs vs onnxruntime-Python (<model>.parity_input.npy / .parity_embedding.npy)
     VerifyModel {
@@ -96,7 +105,8 @@ async fn main() -> Result<()> {
     let db = ops::DbPaths { embeddings: cli.embeddings.clone(), names: cli.names.clone(), ridges: cli.ridges.clone() };
     match &cli.cmd {
         Cmd::Embed { image } => {
-            let st = preprocess(&load(image)?).context("preprocessing failed (no palm region)")?;
+            let roi = card.as_ref().map(|c| c.roi).unwrap_or_default();
+            let st = palmprint::preprocess::preprocess_mode(&load(image)?, roi).context("preprocessing failed (no palm region)")?;
             let e = Encoder::new(&cli.model, cli.threads)?.embed(&st.normalized, TARGET)?;
             println!("{}", serde_json::json!({"preprocess": st.trace, "embedding": e}));
         }
@@ -121,6 +131,13 @@ async fn main() -> Result<()> {
         Cmd::PairScores { split, out, ridge_shift } => {
             let (n, pairs) = ops::pair_scores(&db, card.as_ref(), split, *ridge_shift, out, cli.threads)?;
             eprintln!("[pair-scores] {n} images, {pairs} pairs, ridge shift {ridge_shift} → {}", out.display());
+        }
+        Cmd::Rois { mode, out, dirs } => {
+            let mode: palmprint::preprocess::RoiMode = mode.parse()?;
+            let (n, aligned, fallback, failed) = ops::export_rois(dirs, mode, out, |k, total| {
+                if k % 500 == 0 || k == total { eprintln!("[rois] {k} / {total}"); }
+            })?;
+            println!("{}", serde_json::json!({"event": "rois", "images": n, "valley_aligned": aligned, "centroid_fallback": fallback, "failed": failed, "mode": mode}));
         }
         Cmd::VerifyModel { tol } => {
             let v = ops::verify_model(&cli.model, cli.threads, *tol)?;

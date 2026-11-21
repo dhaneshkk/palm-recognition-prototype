@@ -6,7 +6,8 @@ face, it is shown with a 468-point triangulated mesh (display only, never matche
 
 This is a fork of [lucytrandev/palm-recognition-prototype](https://github.com/lucytrandev/palm-recognition-prototype)
 by Lucy Tran. Her original Python/Streamlit prototype is described [further down](#original-prototype-lucy-tran-2025);
-this fork (branch `rust-inference`) splits it into a Python training pipeline and a Rust inference program.
+this fork splits it into a Python training pipeline and a Rust inference program (branch `master`;
+`rust-inference` is where it was developed).
 
 **New here? Read the [user guide](USER_GUIDE.md)**: training in Colab, building the database,
 calibrating, evaluating, the web page and the API, step by step.
@@ -25,8 +26,12 @@ calibrating, evaluating, the web page and the API, step by step.
                                                                                        serve: web page + /v1/chat/completions
 ```
 
+* **Palm region:** aligned to the finger valleys (index–middle and ring–little gaps), so position,
+  rotation and scale of the hand don't change the crop; cut by the Rust code for both training and
+  inference. The original centroid crop stays available.
 * **Training (Python):** identity-disjoint split (70 % train / 15 % calibration / 15 % test palms),
-  supervised-contrastive loss (or the original NT-Xent), AdamW with **SAM**, model selection by
+  ResNet-18 or MobileFaceNet, supervised-contrastive, sub-center ArcFace or ArcFace (margin warmed up)
+  or the original NT-Xent loss, AdamW with **SAM**, model selection by
   calibration EER, threshold at a target false-accept rate, EER / TAR@FAR / **MCC** / cross-session
   rank-1 on unseen palms. Exports ONNX, a model card and parity fixtures. See [training/README.md](training/README.md).
 * **Inference (Rust):** bit-exact port of the preprocessing, ONNX encoder, cosine matching re-ranked
@@ -41,7 +46,8 @@ calibrating, evaluating, the web page and the API, step by step.
   call and the Lean check.
 * **Proofs:** `rust/lean/Match.lean` and `rust/lean/Pipeline.lean` (Lean 4.31, no `sorry`): match-rule properties, the threshold
   rule keeps the calibration FAR ≤ target (`far_threshold_bound`, `far_le_alpha`), and the fused score
-  never drops when the CNN or ridge match improves (`fuse_mono`, `fuse_ends`), and the web app's
+  never drops when the CNN or ridge match improves (`fuse_mono`, `fuse_ends`), the ArcFace margin
+  warm-up stays within [0, m] and never decreases (`warm_*`), and the web app's
   pipeline can't skip a stage or put a model live before evaluation (`ready_only_after_eval`, `no_skip_*`).
 
 ## Quick start
@@ -49,11 +55,12 @@ calibrating, evaluating, the web page and the API, step by step.
 ```bash
 # training (GPU recommended) — or just run training/train_colab.ipynb in Colab
 pip install -r training/requirements.txt
-python training/prepare.py dataset/archive/session1 dataset/archive/session2 -o data/rois.npz
-python training/train.py data/rois.npz --out rust/models --epochs 40
+(cd rust && cargo build --release)          # the valley crops are cut by the Rust binary
+python training/prepare.py dataset/archive/session1 dataset/archive/session2 -o data/rois.npz --roi valley
+python training/train.py data/rois.npz --out rust/models --epochs 40 --loss subcenter --backbone resnet18
 
 # inference
-cd rust && cargo build --release
+cd rust
 export ORT_DYLIB_PATH=$(python3 -c "import onnxruntime,os,glob;print(glob.glob(os.path.dirname(onnxruntime.__file__)+'/capi/libonnxruntime.so*')[0])")
 B=target/release/palmprint
 $B verify-model

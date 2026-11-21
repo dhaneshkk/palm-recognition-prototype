@@ -117,6 +117,8 @@ pub struct TrainParams {
     pub loss: String,
     pub target_far: f64,
     pub pretrained: bool,
+    pub roi: palmprint::preprocess::RoiMode,
+    pub backbone: String,
 }
 
 pub struct Inner {
@@ -261,7 +263,8 @@ impl App {
             ensure!(d.is_dir(), "{} is not a folder", d.display());
         }
         ensure!((1..=500).contains(&p.epochs), "epochs must be 1–500");
-        ensure!(p.loss == "supcon" || p.loss == "simclr", "loss must be supcon or simclr");
+        ensure!(["supcon", "simclr", "arcface", "subcenter"].contains(&p.loss.as_str()), "loss must be supcon, simclr, arcface or subcenter");
+        ensure!(p.backbone == "resnet18" || p.backbone == "mobilefacenet", "backbone must be resnet18 or mobilefacenet");
         ensure!(p.target_far > 0.0 && p.target_far < 0.5, "target FAR must be between 0 and 0.5");
         self.set_phase(Phase::Preparing, "cutting palm regions with the shared preprocessing")?;
         self.update(|s| {
@@ -350,8 +353,26 @@ impl App {
         std::fs::create_dir_all(cfg.work.join("data"))?;
         let abs = |x: &Path| std::path::absolute(x).unwrap_or_else(|_| x.to_path_buf()).display().to_string();
 
-        // 1 · prepare (Python, same preprocessing as Rust)
-        let mut args: Vec<String> = p.dirs.iter().map(|d| abs(d)).collect();
+        // 1 · prepare: centroid crops in Python (bit-exact with Rust); valley crops cut by Rust
+        // (align.rs) in-process, then packed by Python — one implementation for training and inference
+        let mut args: Vec<String> = vec![];
+        if p.roi == palmprint::preprocess::RoiMode::Valley {
+            let (dirs, prefix) = (p.dirs.clone(), cfg.work.join("data/rois_rust"));
+            let pre2 = prefix.clone();
+            let (n, aligned, fallback, failed) = self
+                .blocking(move |a| {
+                    let a2 = a.clone();
+                    ops::export_rois(&dirs, palmprint::preprocess::RoiMode::Valley, &pre2, move |k, total| {
+                        if k % 20 == 0 || k == total { a2.update(|s| s.progress = (k, total)); }
+                    })
+                })
+                .await?;
+            std::fs::write(prefix.with_extension("stats.json"), serde_json::json!({"images": n, "valley_aligned": aligned, "centroid_fallback": fallback, "failed": failed}).to_string())?;
+            self.log(format!("valley-aligned crops: {aligned} of {n} ({fallback} fell back to the centroid crop, {failed} failed)"));
+            args.extend(["--roi".into(), "valley".into(), "--from-rust-rois".into(), abs(&prefix)]);
+        } else {
+            args.extend(p.dirs.iter().map(|d| abs(d)));
+        }
         args.extend(["-o".into(), abs(&cfg.rois())]);
         self.python("training/prepare.py", &args, |a, ev| match ev["event"].as_str() {
             Some("prepare") => a.update(|s| s.progress = (ev["done"].as_u64().unwrap_or(0) as usize, 0)),
@@ -361,8 +382,8 @@ impl App {
         .await?;
 
         // 2 · train (Python, SAM)
-        self.set_phase(Phase::Training, format!("{} epochs, {} loss, SAM", p.epochs, p.loss))?;
-        let mut args = vec![abs(&cfg.rois()), "--out".into(), abs(&cfg.models()), "--epochs".into(), p.epochs.to_string(), "--loss".into(), p.loss.clone(), "--target-far".into(), p.target_far.to_string()];
+        self.set_phase(Phase::Training, format!("{} epochs, {} on {}, {:?} crops, SAM", p.epochs, p.loss, p.backbone, p.roi))?;
+        let mut args = vec![abs(&cfg.rois()), "--out".into(), abs(&cfg.models()), "--epochs".into(), p.epochs.to_string(), "--loss".into(), p.loss.clone(), "--backbone".into(), p.backbone.clone(), "--target-far".into(), p.target_far.to_string()];
         if !p.pretrained {
             args.push("--no-pretrained".into());
         }

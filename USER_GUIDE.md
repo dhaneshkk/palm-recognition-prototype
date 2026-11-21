@@ -65,9 +65,10 @@ Open **http://127.0.0.1:3000**.
 1. **folders**: your session folders, comma-separated (e.g. `/data/palms/session1,/data/palms/session2`).
    No dataset at hand? Press **Make demo data** and leave the field empty: it trains on drawn hands,
    which only shows the pipeline works.
-2. **epochs** (40 is a start on a GPU; on a laptop CPU try 6–10 first), **loss** `supcon` (uses the
-   palm identities) or `simclr` (the original self-supervised loss), **target FAR** (0.001 = 0.1 % false
-   accepts), **ImageNet start** (needs internet once).
+2. **epochs** (40 is a start on a GPU; on a laptop CPU try 6–10 first), **loss** `supcon`,
+   `subcenter`, `arcface` or `simclr` (§4), **target FAR** (0.001 = 0.1 % false accepts), **ImageNet
+   start** (needs internet once), **crop** `valley` (recommended) or `centroid`, **backbone**
+   `resnet18` or `mobilefacenet`.
 3. **Start training.** The Pipeline panel walks through six phases: preparing → training (loss and
    calibration error per epoch are charted) → verifying → building the database (progress bar) →
    fusion → evaluating. **Cancel** stops it; the live model isn't touched.
@@ -87,7 +88,7 @@ finished run on its next start. Other settings are listed in [rust/README.md](ru
 You need Python 3.10+, Rust (stable), git and, for training, ideally an NVIDIA GPU.
 
 ```bash
-git clone -b rust-inference https://github.com/dhaneshkk/palm-recognition-prototype
+git clone https://github.com/dhaneshkk/palm-recognition-prototype
 cd palm-recognition-prototype
 python3 -m venv .venv && source .venv/bin/activate
 pip install -r training/requirements.txt
@@ -109,17 +110,34 @@ different number of images per palm.
 ## 4. Train the model
 
 ```bash
-python training/prepare.py dataset/archive/session1 dataset/archive/session2 -o data/rois.npz
-python training/train.py data/rois.npz --out rust/models --epochs 40
+(cd rust && cargo build --release)       # valley crops are cut by the Rust program
+python training/prepare.py dataset/archive/session1 dataset/archive/session2 -o data/rois.npz --roi valley
+python training/train.py data/rois.npz --out rust/models --epochs 40 --loss subcenter
 ```
 
 * `prepare.py` cuts the palm region from every image exactly as the Rust program will, and reports how
   many images failed (no palm region found).
+  * `--roi valley` (recommended) finds the gaps between index–middle and ring–little fingers, rotates
+    and scales the crop to them, so where and how the hand was held matters much less. It needs the
+    fingers spread enough to see the gaps; images where they can't be found fall back to the original
+    crop, and the count is printed (`centroid_fallback`). The Rust program cuts these crops for
+    training and for matching, so both always agree.
+  * `--roi centroid` is the original crop around the hand's centre.
 * `train.py` prints one line per epoch, with the loss and the error rate on the calibration palms. It
   keeps the best epoch, picks the match threshold, scores the test palms and exports the model.
 
-Useful options: `--epochs`, `--target-far` (default 0.001 = 0.1 % false accepts), `--loss simclr`
-(the original self-supervised loss instead of using palm labels), `--no-pretrained` (offline).
+Useful options:
+
+| Option | Choices | Notes |
+|---|---|---|
+| `--loss` | `supcon` (default), `subcenter`, `arcface`, `simclr` | `subcenter` = sub-center ArcFace (3 centres per palm); `arcface` = 1 centre; both start with no margin and reach it after `--margin-warmup` epochs (3), with a small SupCon term (`--aux-supcon 0.1`); `simclr` = the original self-supervised loss |
+| `--margin`, `--scale` | 0.5, 30 | ArcFace margin and scale; lower the scale for very few palms |
+| `--backbone` | `resnet18` (default), `mobilefacenet` | MobileFaceNet: ~1.2 M parameters, faster on CPU, no ImageNet start; needs smaller batches on small machines (`--p 8`) |
+| `--epochs`, `--target-far` | 40, 0.001 | 0.001 = 0.1 % false accepts |
+| `--no-pretrained` | | offline: start ResNet-18 from scratch |
+
+Every option is trained under SAM, and the card records the crop, loss and backbone, so the Rust
+program cuts the crop the same way at matching time.
 
 Training writes `rust/models/palmprint_encoder_512.onnx`, replacing the original model, plus
 `palmprint_encoder_512.card.json` (threshold, which palms are test palms, metrics) and two parity files.
@@ -229,6 +247,9 @@ and triangles) and the preprocessing trace.
 | "--split needs a model card" | there's no `.card.json` next to the model (original model): use `--split all` |
 | "could not preprocess the image" | no bright palm region on a dark background was found; the method expects images like the dataset's |
 | Many failures in `prepare.py` | the images don't have a dark background around the palm; the preprocessing is tuned for this dataset |
+| Many `centroid_fallback` with `--roi valley` | the finger gaps aren't visible (fingers together, cut off, or wrist at the top); those images use the original crop |
+| `prepare.py --roi valley`: "palmprint not found" | build the Rust program first: `cd rust && cargo build --release` |
+| Training killed with no error (MobileFaceNet) | out of memory: use `--p 8` (8 palms per batch) or a GPU |
 | Fused results no better | expected on some data; the card's `fusion.calibration.eer_by_weight` shows the trade-off |
 | Training very slow | use a GPU (Colab T4); on CPU, reduce `--epochs` |
 | Web app: "asset bundle missing" | run `topcoat asset bundle -p palmprint-web --release` in `rust/` |

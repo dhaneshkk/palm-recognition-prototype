@@ -4,7 +4,7 @@
 use crate::card::{card_path, sha256_file, ModelCard};
 use crate::encoder::{Encoder, EMBED_DIM};
 use crate::matcher::Database;
-use crate::preprocess::{load, preprocess, TARGET};
+use crate::preprocess::{load, preprocess_mode, RoiMode, TARGET};
 use crate::ridges::{RidgeCoder, RidgeDb};
 use crate::{eval, fusion, npy, server};
 use anyhow::{bail, ensure, Context, Result};
@@ -37,24 +37,16 @@ pub fn images_in(dir: &Path) -> Result<Vec<PathBuf>> {
 
 /// (images embedded, images that failed preprocessing)
 pub fn build_db(model: &Path, dirs: &[PathBuf], db: &DbPaths, roi_dir: Option<&Path>, threads: usize, mut progress: impl FnMut(usize, usize)) -> Result<(usize, usize)> {
+    let mode = ModelCard::load_for(model)?.map(|c| c.roi).unwrap_or_default();
     let mut enc = Encoder::new(model, threads)?;
     if let Some(d) = roi_dir {
         std::fs::create_dir_all(d)?;
     }
-    let files: Vec<(String, PathBuf)> = dirs
-        .iter()
-        .map(|dir| {
-            let folder = dir.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
-            Ok(images_in(dir)?.into_iter().map(move |p| (format!("{folder}_{}", p.file_stem().unwrap().to_string_lossy()), p)))
-        })
-        .collect::<Result<Vec<_>>>()?
-        .into_iter()
-        .flatten()
-        .collect();
+    let files = list_images(dirs)?;
     let (mut names, mut data, mut codes, mut failed) = (vec![], vec![], vec![], 0usize);
     let rc = RidgeCoder::new(1);
     for (k, (name, p)) in files.iter().enumerate() {
-        match load(p).ok().and_then(|i| preprocess(&i)) {
+        match load(p).ok().and_then(|i| preprocess_mode(&i, mode)) {
             Some(st) => {
                 if let Some(d) = roi_dir {
                     npy::write_f32(&d.join(format!("{name}.npy")), TARGET, TARGET, &st.normalized)?;
@@ -177,5 +169,46 @@ pub fn engine(model: &Path, db_paths: &DbPaths, threshold: Option<f32>, top_k: u
         ridges,
         fusion,
         faces: if faces { Some(crate::faces::Faces::new(threads)?) } else { None },
+        roi: card.as_ref().map(|c| c.roi).unwrap_or_default(),
     })
+}
+
+/// Palm regions for training (`training/prepare.py --roi valley` calls this through `palmprint rois`):
+/// writes `<out>.u8.npy` (rows of 138×138 uint8), `<out>.names.npy`, returns (written, valley-aligned,
+/// fallback-to-centroid, failed).
+pub fn export_rois(dirs: &[PathBuf], mode: RoiMode, out: &Path, mut progress: impl FnMut(usize, usize)) -> Result<(usize, usize, usize, usize)> {
+    let files = list_images(dirs)?;
+    let (mut names, mut data, mut aligned, mut fallback, mut failed) = (vec![], vec![], 0, 0, 0);
+    for (k, (name, p)) in files.iter().enumerate() {
+        match load(p).ok().and_then(|i| preprocess_mode(&i, mode)) {
+            Some(st) => {
+                if st.trace.valleys.is_some() { aligned += 1 } else if mode == RoiMode::Valley { fallback += 1 }
+                data.extend_from_slice(&st.resized.data);
+                names.push(name.clone());
+            }
+            None => failed += 1,
+        }
+        progress(k + 1, files.len());
+    }
+    ensure!(!names.is_empty(), "no image could be preprocessed");
+    if let Some(d) = out.parent() {
+        std::fs::create_dir_all(d)?;
+    }
+    npy::write_u8(&out.with_extension("u8.npy"), names.len(), TARGET * TARGET, &data)?;
+    npy::write_strings(&out.with_extension("names.npy"), &names)?;
+    Ok((names.len(), aligned, fallback, failed))
+}
+
+/// (`<folder>_<stem>`, path) for every image in the folders, in order.
+fn list_images(dirs: &[PathBuf]) -> Result<Vec<(String, PathBuf)>> {
+    Ok(dirs
+        .iter()
+        .map(|dir| {
+            let folder = dir.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
+            Ok(images_in(dir)?.into_iter().map(move |p| (format!("{folder}_{}", p.file_stem().unwrap().to_string_lossy()), p)))
+        })
+        .collect::<Result<Vec<_>>>()?
+        .into_iter()
+        .flatten()
+        .collect())
 }

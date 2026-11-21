@@ -7,7 +7,7 @@
 use crate::encoder::Encoder;
 use crate::imgproc::GrayImage;
 use crate::matcher::{Database, MatchResult};
-use crate::preprocess::{load_bytes, preprocess, Trace, TARGET};
+use crate::preprocess::{load_bytes, Trace, TARGET};
 use anyhow::{anyhow, Result};
 use axum::extract::{DefaultBodyLimit, Multipart, State};
 use axum::response::{Html, IntoResponse, Json, Response};
@@ -36,6 +36,8 @@ pub struct Engine {
     pub roi_dir: Option<PathBuf>,
     pub threshold: f32,
     pub top_k: usize,
+    /// palm-region cut, from the model card (centroid for models without one)
+    pub roi: crate::preprocess::RoiMode,
 }
 
 #[derive(Serialize, Clone)]
@@ -103,7 +105,7 @@ impl Engine {
             }
             None => (vec![], String::new()),
         };
-        let Some(st) = preprocess(&img) else {
+        let Some(st) = crate::preprocess::preprocess_mode(&img, self.roi) else {
             if faces.is_empty() {
                 return Err(anyhow!("could not preprocess the image (no palm region found above the threshold)"));
             }

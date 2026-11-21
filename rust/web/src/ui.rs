@@ -22,7 +22,7 @@ fn report(r: anyhow::Result<String>) -> Result<String> {
 
 // ── actions (browser → server) ────────────────────────────────────────────────
 #[procedure]
-async fn train(cx: &Cx, dirs: String, epochs: String, loss: String, far: String, pretrained: bool) -> Result<String> {
+async fn train(cx: &Cx, dirs: String, epochs: String, loss: String, far: String, pretrained: bool, roi: String, backbone: String) -> Result<String> {
     let app = context::<App>(cx);
     let p = (|| -> anyhow::Result<TrainParams> {
         Ok(TrainParams {
@@ -34,6 +34,8 @@ async fn train(cx: &Cx, dirs: String, epochs: String, loss: String, far: String,
             loss: loss.trim().to_lowercase(),
             target_far: far.trim().parse().map_err(|_| anyhow::anyhow!("target FAR must be a number, e.g. 0.001"))?,
             pretrained,
+            roi: roi.parse()?,
+            backbone: backbone.trim().to_lowercase(),
         })
     })();
     report(p.and_then(|p| app.start_training(p)))
@@ -116,6 +118,8 @@ async fn controls(cx: &Cx) -> Result<impl View> {
     let loss = signal(cx, || "supcon".to_string());
     let far = signal(cx, || "0.001".to_string());
     let pretrained = signal(cx, || true);
+    let roi = signal(cx, || "valley".to_string());
+    let backbone = signal(cx, || "resnet18".to_string());
     let msg = signal(cx, String::new);
     Ok(view! {
         <div class="card controls">
@@ -128,10 +132,13 @@ async fn controls(cx: &Cx) -> Result<impl View> {
             <label>"target FAR " <input size="6" :value=$(far.get()) @input=$(|e: Event| far.set(e.target.value))></label>
             <label class="check"><input type="checkbox" :checked=$(pretrained.get()) @change=$(|e: Event| pretrained.set(e.target.checked))>" ImageNet start"</label>
             <br>
-            <button @click=$(async |_e| { let m = train(dirs.get(), epochs.get(), loss.get(), far.get(), pretrained.get()).await; msg.set(m); })>"Start training"</button>
+            <label>"crop " <input size="8" :value=$(roi.get()) @input=$(|e: Event| roi.set(e.target.value))></label>
+            <label>"backbone " <input size="13" :value=$(backbone.get()) @input=$(|e: Event| backbone.set(e.target.value))></label>
+            <br>
+            <button @click=$(async |_e| { let m = train(dirs.get(), epochs.get(), loss.get(), far.get(), pretrained.get(), roi.get(), backbone.get()).await; msg.set(m); })>"Start training"</button>
             <button class="ghost" @click=$(async |_e| { let m = cancel().await; msg.set(m); })>"Cancel"</button>
             <button class="ghost" @click=$(async |_e| { let m = demo().await; msg.set(m); })>"Make demo data"</button>
-            <p class="hint">"loss: supcon (uses palm identities) or simclr (the original self-supervised loss). ImageNet start needs internet for the weights."</p>
+            <p class="hint">"loss: supcon (palm identities, contrastive), subcenter or arcface (angular margin, warmed up), simclr (the original self-supervised loss). crop: valley (aligned to the finger valleys, recommended) or centroid (the original crop). backbone: resnet18 or mobilefacenet (~1 M parameters, GDConv head; no ImageNet weights). ImageNet start needs internet."</p>
             <p class="msg">$(msg.get())</p>
         </div>
     })

@@ -34,6 +34,9 @@ pub struct ModelCard {
     pub metrics: serde_json::Value,
     #[serde(default)]
     pub fusion: Option<Fusion>,
+    /// how the palm region was cut for training (inference must cut it the same way)
+    #[serde(default)]
+    pub roi: crate::preprocess::RoiMode,
 }
 
 /// `models/x.onnx` → `models/x.card.json`
